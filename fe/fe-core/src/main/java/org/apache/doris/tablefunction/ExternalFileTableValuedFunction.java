@@ -37,6 +37,7 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.Status;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.profile.SummaryProfile;
 import org.apache.doris.common.util.FileFormatConstants;
@@ -66,6 +67,7 @@ import org.apache.doris.proto.Types.PTypeDesc;
 import org.apache.doris.proto.Types.PTypeNode;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.SessionVariable;
+import org.apache.doris.qe.StmtExecutor;
 import org.apache.doris.resource.computegroup.ComputeGroupMgr;
 import org.apache.doris.rpc.BackendServiceProxy;
 import org.apache.doris.rpc.RpcException;
@@ -83,6 +85,7 @@ import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TPrimitiveType;
 import org.apache.doris.thrift.TStatusCode;
 
+import com.google.common.base.Ascii;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -95,6 +98,7 @@ import org.apache.thrift.TSerializer;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -103,6 +107,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.stream.Collectors;
@@ -115,6 +120,7 @@ public abstract class ExternalFileTableValuedFunction extends TableValuedFunctio
     protected static final String URI_KEY = "uri";
 
     public static final String PROP_TABLE_ID = "table_id";
+    private static final String PROP_MERGE_SCHEMA = "merge_schema";
 
     // Columns got from file and path(if has)
     protected List<Column> columns = null;
@@ -136,6 +142,7 @@ public abstract class ExternalFileTableValuedFunction extends TableValuedFunctio
     public FileFormatProperties fileFormatProperties;
     private String hiveParquetTimeZone = "";
     private long tableId;
+    private boolean mergeSchema;
 
     public abstract TFileType getTFileType();
 
@@ -234,6 +241,14 @@ public abstract class ExternalFileTableValuedFunction extends TableValuedFunctio
 
         String formatString = getOrDefaultAndRemove(copiedProps, FileFormatConstants.PROP_FORMAT, "").toLowerCase();
         fileFormatProperties = FileFormatProperties.createFileFormatProperties(formatString);
+
+        mergeSchema = Util.getBooleanPropertyOrDefault(copiedProps, PROP_MERGE_SCHEMA, false);
+        copiedProps.remove(PROP_MERGE_SCHEMA);
+        if (mergeSchema && (!(this instanceof S3TableValuedFunction || this instanceof HdfsTableValuedFunction)
+                || (fileFormatProperties.getFileFormatType() != TFileFormatType.FORMAT_PARQUET
+                && fileFormatProperties.getFileFormatType() != TFileFormatType.FORMAT_ORC))) {
+            throw new AnalysisException("merge_schema is only supported for Parquet/ORC S3 and HDFS TVFs");
+        }
 
         // Logical file types retain binary bytes and instant semantics regardless of legacy flags.
         copiedProps.remove(FileFormatConstants.PROP_ENABLE_MAPPING_VARBINARY);
@@ -335,6 +350,9 @@ public abstract class ExternalFileTableValuedFunction extends TableValuedFunctio
         }
 
         TNetworkAddress address = new TNetworkAddress(be.getHost(), be.getBrpcPort());
+        if (mergeSchema) {
+            return getMergedTableColumns(address);
+        }
         try {
             if (getTFileType() == TFileType.FILE_STREAM) {
                 fileStatuses.add(new TBrokerFileStatus("", false, -1, true));
@@ -382,6 +400,83 @@ public abstract class ExternalFileTableValuedFunction extends TableValuedFunctio
             throw new AnalysisException("getFetchTableStructureRequest exception", e);
         }
         return columns;
+    }
+
+    private List<Column> getMergedTableColumns(TNetworkAddress address) throws AnalysisException {
+        Map<String, Column> merged = new TreeMap<>();
+        int fileIndex = 0;
+        try {
+            for (TBrokerFileStatus file : fileStatuses) {
+                if (isFileContentEmpty(file)) {
+                    continue;
+                }
+                StmtExecutor executor = ConnectContext.get().getExecutor();
+                Status cancelReason = executor == null ? null : executor.getPendingCancelReason();
+                if (cancelReason != null) {
+                    throw new AnalysisException(cancelReason.getErrorMsg());
+                }
+                fileIndex++;
+                PFetchTableSchemaRequest request = getFetchTableStructureRequest(
+                        Collections.singletonList(file).iterator());
+                InternalService.PFetchTableSchemaResult result = BackendServiceProxy.getInstance()
+                        .fetchTableStructureAsync(address, request).get();
+                TStatusCode code = TStatusCode.findByValue(result.getStatus().getStatusCode());
+                if (code != TStatusCode.OK) {
+                    String message = result.getStatus().getErrorMsgsList().isEmpty()
+                            ? String.valueOf(code) : result.getStatus().getErrorMsgsList().get(0);
+                    throw new AnalysisException("Failed to read schema of matched file " + fileIndex + ": " + message);
+                }
+                mergeFileSchema(result, merged, fileIndex);
+            }
+        } catch (RpcException | ExecutionException | TException e) {
+            throw new AnalysisException("Failed to read schema of matched file " + fileIndex, e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AnalysisException("Schema discovery interrupted", e);
+        }
+        if (fileIndex == 0) {
+            columns = Lists.newArrayList();
+            fillColumns(null);
+            return columns;
+        }
+        List<Column> result = new ArrayList<>(merged.values());
+        Set<String> names = new HashSet<>(merged.keySet());
+        for (String name : pathPartitionKeys) {
+            if (!names.add(name.toLowerCase(Locale.ROOT))) {
+                throw new AnalysisException("Path partition column conflicts with an existing column: " + name);
+            }
+            result.add(new Column(name, ScalarType.createVarcharType(ScalarType.MAX_VARCHAR_LENGTH), false));
+        }
+        columns = result;
+        return columns;
+    }
+
+    void mergeFileSchema(InternalService.PFetchTableSchemaResult schema, Map<String, Column> merged, int fileIndex)
+            throws AnalysisException {
+        Set<String> names = new HashSet<>();
+        for (int i = 0; i < schema.getColumnNums(); i++) {
+            String originalName = schema.getColumnNames(i);
+            String name = originalName.toLowerCase(Locale.ROOT);
+            if (!Ascii.toLowerCase(originalName).equals(name)) {
+                throw new AnalysisException("Unsupported non-ASCII case conversion in matched file " + fileIndex
+                        + ": " + originalName);
+            }
+            if (!names.add(name)) {
+                throw new AnalysisException("Repeated lowercase column names in matched file " + fileIndex + ": "
+                        + name);
+            }
+            Type type = getColumnType(schema.getColumnTypes(i).getTypesList(), 0).key();
+            if (!type.isScalarType() || type.isVariantType() || !type.isSupported()) {
+                throw new AnalysisException("Unsupported schema in matched file " + fileIndex + ": " + name
+                        + " has type " + type.toSql());
+            }
+            Column previous = merged.get(name);
+            if (previous != null && !previous.getType().equals(type)) {
+                throw new AnalysisException("Conflicting types for column " + name + " in matched file " + fileIndex
+                        + ": " + previous.getType().toSql() + " and " + type.toSql());
+            }
+            merged.putIfAbsent(name, new Column(name, type, true));
+        }
     }
 
     protected Backend getBackend() {
