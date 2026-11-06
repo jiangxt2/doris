@@ -17,9 +17,11 @@
 
 package org.apache.doris.tablefunction;
 
+import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.Status;
 import org.apache.doris.common.util.S3Util;
 import org.apache.doris.fs.FileSystemFactory;
 import org.apache.doris.nereids.StatementContext;
@@ -32,6 +34,7 @@ import org.apache.doris.proto.Types.PStatus;
 import org.apache.doris.proto.Types.PTypeDesc;
 import org.apache.doris.proto.Types.PTypeNode;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.StmtExecutor;
 import org.apache.doris.rpc.BackendServiceProxy;
 import org.apache.doris.system.Backend;
 import org.apache.doris.thrift.TBrokerFileStatus;
@@ -51,8 +54,11 @@ import org.mockito.Mockito;
 
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
 
 public class S3TableValuedFunctionTest {
     private static final Map<String, String> PROPERTIES = Map.of(
@@ -126,6 +132,181 @@ public class S3TableValuedFunctionTest {
             }
             Assertions.assertEquals(2, tvf.getFileStatuses().size());
         }
+    }
+
+    @Test
+    public void testMergeSchemaReadsEveryFileAndFailsOnMissingFile() throws Exception {
+        for (String format : Arrays.asList("parquet", "orc")) {
+            Map<String, String> props = new HashMap<>(PROPERTIES);
+            props.put("format", format);
+            props.put("merge_schema", "true");
+            S3TableValuedFunction tvf = Mockito.spy(new S3TableValuedFunction(props,
+                    Arrays.asList(file("old", 10), file("empty", 0), file("new", 10))));
+            Backend backend = Mockito.mock(Backend.class);
+            Mockito.when(backend.getHost()).thenReturn("127.0.0.1");
+            Mockito.when(backend.getBrpcPort()).thenReturn(8060);
+            Mockito.doReturn(backend).when(tvf).getBackend();
+            BackendServiceProxy proxy = Mockito.mock(BackendServiceProxy.class);
+            Mockito.when(proxy.fetchTableStructureAsync(Mockito.any(), Mockito.any()))
+                    .thenReturn(CompletableFuture.completedFuture(schema("id", TPrimitiveType.INT)),
+                            CompletableFuture.completedFuture(schema("campaign", TPrimitiveType.STRING)));
+            try (MockedStatic<BackendServiceProxy> service = Mockito.mockStatic(BackendServiceProxy.class)) {
+                service.when(BackendServiceProxy::getInstance).thenReturn(proxy);
+                Assertions.assertEquals(Arrays.asList("campaign", "id"), tvf.getTableColumns().stream()
+                        .map(Column::getName).collect(Collectors.toList()));
+                Assertions.assertTrue(tvf.getTableColumns().stream().allMatch(Column::isAllowNull));
+                ArgumentCaptor<PFetchTableSchemaRequest> requests =
+                        ArgumentCaptor.forClass(PFetchTableSchemaRequest.class);
+                Mockito.verify(proxy, Mockito.times(2)).fetchTableStructureAsync(Mockito.any(), requests.capture());
+                for (int i = 0; i < 2; i++) {
+                    TFileScanRange range = new TFileScanRange();
+                    new TDeserializer().deserialize(range,
+                            requests.getAllValues().get(i).getFileScanRange().toByteArray());
+                    Assertions.assertEquals(tvf.getFileStatuses().get(i * 2).getPath(),
+                            range.getRanges().get(0).getPath());
+                }
+            }
+            S3TableValuedFunction failing = Mockito.spy(new S3TableValuedFunction(props,
+                    Arrays.asList(file("old", 10), file("missing", 10))));
+            Mockito.doReturn(backend).when(failing).getBackend();
+            BackendServiceProxy failureProxy = Mockito.mock(BackendServiceProxy.class);
+            Mockito.when(failureProxy.fetchTableStructureAsync(Mockito.any(), Mockito.any()))
+                    .thenReturn(CompletableFuture.completedFuture(schema("id", TPrimitiveType.INT)),
+                            CompletableFuture.completedFuture(result(TStatusCode.NOT_FOUND)));
+            try (MockedStatic<BackendServiceProxy> service = Mockito.mockStatic(BackendServiceProxy.class)) {
+                service.when(BackendServiceProxy::getInstance).thenReturn(failureProxy);
+                Assertions.assertThrows(AnalysisException.class, failing::getTableColumns);
+                Assertions.assertEquals(2, failing.getFileStatuses().size());
+                Mockito.verify(failureProxy, Mockito.times(2)).fetchTableStructureAsync(Mockito.any(), Mockito.any());
+            }
+        }
+    }
+
+    @Test
+    public void testMergeSchemaStopsSubmittingAfterCancellation() throws Exception {
+        for (boolean cancelBeforeFirstFile : Arrays.asList(true, false)) {
+            Map<String, String> props = new HashMap<>(PROPERTIES);
+            props.put("format", "parquet");
+            props.put("merge_schema", "true");
+            S3TableValuedFunction tvf = Mockito.spy(new S3TableValuedFunction(props,
+                    Arrays.asList(file("old", 10), file("new", 10))));
+            Backend backend = Mockito.mock(Backend.class);
+            Mockito.when(backend.getHost()).thenReturn("127.0.0.1");
+            Mockito.when(backend.getBrpcPort()).thenReturn(8060);
+            Mockito.doReturn(backend).when(tvf).getBackend();
+            StmtExecutor executor = Mockito.mock(StmtExecutor.class);
+            Status cancelled = new Status(TStatusCode.CANCELLED, "query cancelled");
+            if (cancelBeforeFirstFile) {
+                Mockito.when(executor.getPendingCancelReason()).thenReturn(cancelled);
+            } else {
+                Mockito.when(executor.getPendingCancelReason()).thenReturn(null, cancelled);
+            }
+            ConnectContext.get().setExecutor(executor);
+            BackendServiceProxy proxy = Mockito.mock(BackendServiceProxy.class);
+            Mockito.when(proxy.fetchTableStructureAsync(Mockito.any(), Mockito.any()))
+                    .thenReturn(CompletableFuture.completedFuture(schema("id", TPrimitiveType.INT)));
+            try (MockedStatic<BackendServiceProxy> service = Mockito.mockStatic(BackendServiceProxy.class)) {
+                service.when(BackendServiceProxy::getInstance).thenReturn(proxy);
+                AnalysisException error = Assertions.assertThrows(AnalysisException.class, tvf::getTableColumns);
+                Assertions.assertTrue(error.getMessage().contains("query cancelled"));
+                Mockito.verify(proxy, Mockito.times(cancelBeforeFirstFile ? 0 : 1))
+                        .fetchTableStructureAsync(Mockito.any(), Mockito.any());
+            }
+        }
+    }
+
+    @Test
+    public void testMergeSchemaRejectsConflictsAndInvalidProperties() throws Exception {
+        S3TableValuedFunction tvf = tvf();
+        Map<String, Column> merged = new TreeMap<>();
+        tvf.mergeFileSchema(schema("ID", TPrimitiveType.INT), merged, 1);
+        tvf.mergeFileSchema(schema("id", TPrimitiveType.INT), merged, 2);
+        Assertions.assertEquals(1, merged.size());
+        Assertions.assertThrows(AnalysisException.class,
+                () -> tvf.mergeFileSchema(schema("id", TPrimitiveType.BIGINT), merged, 3));
+        PFetchTableSchemaResult duplicate = schema("id", TPrimitiveType.INT).toBuilder()
+                .setColumnNums(2).addColumnNames("ID")
+                .addColumnTypes(schema("id", TPrimitiveType.INT).getColumnTypes(0)).build();
+        Assertions.assertThrows(AnalysisException.class, () -> tvf.mergeFileSchema(duplicate, new TreeMap<>(), 1));
+        PFetchTableSchemaResult complex = PFetchTableSchemaResult.newBuilder().setColumnNums(1)
+                .addColumnNames("nested").addColumnTypes(PTypeDesc.newBuilder()
+                        .addTypes(PTypeNode.newBuilder().setType(TTypeNodeType.STRUCT.getValue())
+                                .setScalarType(PScalarType.newBuilder().setType(TPrimitiveType.STRUCT.getValue()))))
+                .build();
+        Assertions.assertThrows(AnalysisException.class, () -> tvf.mergeFileSchema(complex, new TreeMap<>(), 1));
+        Map<String, String> props = new HashMap<>(PROPERTIES);
+        props.put("merge_schema", "invalid");
+        Assertions.assertThrows(AnalysisException.class, () -> new S3TableValuedFunction(props));
+        props.put("merge_schema", "true");
+        Assertions.assertThrows(AnalysisException.class, () -> new S3TableValuedFunction(props));
+    }
+
+    @Test
+    public void testMergeSchemaEmptyAndPartitionConflict() throws Exception {
+        Map<String, String> props = new HashMap<>(PROPERTIES);
+        props.put("format", "parquet");
+        props.put("merge_schema", "true");
+        props.put("path_partition_keys", "campaign");
+        Backend backend = Mockito.mock(Backend.class);
+        Mockito.when(backend.getHost()).thenReturn("127.0.0.1");
+        Mockito.when(backend.getBrpcPort()).thenReturn(8060);
+        S3TableValuedFunction empty = Mockito.spy(new S3TableValuedFunction(props,
+                Collections.singletonList(file("empty", 0))));
+        Mockito.doReturn(backend).when(empty).getBackend();
+        Assertions.assertEquals("__dummy_col", empty.getTableColumns().get(0).getName());
+
+        S3TableValuedFunction conflicting = Mockito.spy(new S3TableValuedFunction(props,
+                Collections.singletonList(file("one", 10))));
+        Mockito.doReturn(backend).when(conflicting).getBackend();
+        BackendServiceProxy proxy = Mockito.mock(BackendServiceProxy.class);
+        Mockito.when(proxy.fetchTableStructureAsync(Mockito.any(), Mockito.any()))
+                .thenReturn(CompletableFuture.completedFuture(schema("CAMPAIGN", TPrimitiveType.STRING)));
+        try (MockedStatic<BackendServiceProxy> service = Mockito.mockStatic(BackendServiceProxy.class)) {
+            service.when(BackendServiceProxy::getInstance).thenReturn(proxy);
+            Assertions.assertThrows(AnalysisException.class, conflicting::getTableColumns);
+        }
+    }
+
+    @Test
+    public void testMergeSchemaParameterizedTypes() throws Exception {
+        S3TableValuedFunction tvf = tvf();
+        Map<String, Column> merged = new TreeMap<>();
+        tvf.mergeFileSchema(parameterizedSchema("amount", TPrimitiveType.DECIMAL64, 0, 12, 2), merged, 1);
+        tvf.mergeFileSchema(parameterizedSchema("amount", TPrimitiveType.DECIMAL64, 0, 12, 2), merged, 2);
+        Assertions.assertThrows(AnalysisException.class,
+                () -> tvf.mergeFileSchema(parameterizedSchema("amount", TPrimitiveType.DECIMAL64, 0, 12, 3),
+                        merged, 3));
+        Assertions.assertThrows(AnalysisException.class,
+                () -> tvf.mergeFileSchema(parameterizedSchema("amount", TPrimitiveType.DECIMAL64, 0, 13, 2),
+                        merged, 3));
+        tvf.mergeFileSchema(parameterizedSchema("name", TPrimitiveType.VARCHAR, 10, 0, 0), merged, 1);
+        Assertions.assertThrows(AnalysisException.class,
+                () -> tvf.mergeFileSchema(parameterizedSchema("name", TPrimitiveType.VARCHAR, 20, 0, 0),
+                        merged, 2));
+        tvf.mergeFileSchema(parameterizedSchema("ts", TPrimitiveType.DATETIMEV2, 0, 0, 3), merged, 1);
+        Assertions.assertThrows(AnalysisException.class,
+                () -> tvf.mergeFileSchema(parameterizedSchema("ts", TPrimitiveType.DATETIMEV2, 0, 0, 6),
+                        merged, 2));
+    }
+
+    private static PFetchTableSchemaResult parameterizedSchema(String name, TPrimitiveType type,
+            int length, int precision, int scale) {
+        return PFetchTableSchemaResult.newBuilder()
+                .setStatus(PStatus.newBuilder().setStatusCode(TStatusCode.OK.getValue()))
+                .setColumnNums(1).addColumnNames(name)
+                .addColumnTypes(PTypeDesc.newBuilder().addTypes(PTypeNode.newBuilder()
+                        .setType(TTypeNodeType.SCALAR.getValue())
+                        .setScalarType(PScalarType.newBuilder().setType(type.getValue()).setLen(length)
+                                .setPrecision(precision).setScale(scale)))).build();
+    }
+
+    private static PFetchTableSchemaResult schema(String name, TPrimitiveType type) {
+        return PFetchTableSchemaResult.newBuilder()
+                .setStatus(PStatus.newBuilder().setStatusCode(TStatusCode.OK.getValue()))
+                .setColumnNums(1).addColumnNames(name)
+                .addColumnTypes(PTypeDesc.newBuilder().addTypes(PTypeNode.newBuilder()
+                        .setType(TTypeNodeType.SCALAR.getValue())
+                        .setScalarType(PScalarType.newBuilder().setType(type.getValue())))).build();
     }
 
     @Test
