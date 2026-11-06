@@ -85,6 +85,7 @@ import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TPrimitiveType;
 import org.apache.doris.thrift.TStatusCode;
 
+import com.google.common.base.Ascii;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -454,7 +455,12 @@ public abstract class ExternalFileTableValuedFunction extends TableValuedFunctio
             throws AnalysisException {
         Set<String> names = new HashSet<>();
         for (int i = 0; i < schema.getColumnNums(); i++) {
-            String name = schema.getColumnNames(i).toLowerCase(Locale.ROOT);
+            String originalName = schema.getColumnNames(i);
+            String name = originalName.toLowerCase(Locale.ROOT);
+            if (!Ascii.toLowerCase(originalName).equals(name)) {
+                throw new AnalysisException("Unsupported non-ASCII case conversion in matched file " + fileIndex
+                        + ": " + originalName);
+            }
             if (!names.add(name)) {
                 throw new AnalysisException("Repeated lowercase column names in matched file " + fileIndex + ": "
                         + name);

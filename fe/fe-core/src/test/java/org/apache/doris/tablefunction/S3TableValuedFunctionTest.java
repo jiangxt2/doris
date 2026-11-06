@@ -222,6 +222,13 @@ public class S3TableValuedFunctionTest {
         tvf.mergeFileSchema(schema("ID", TPrimitiveType.INT), merged, 1);
         tvf.mergeFileSchema(schema("id", TPrimitiveType.INT), merged, 2);
         Assertions.assertEquals(1, merged.size());
+        tvf.mergeFileSchema(schema("ä", TPrimitiveType.INT), merged, 2);
+        Assertions.assertTrue(merged.containsKey("ä"));
+        Assertions.assertEquals(2, merged.size());
+        AnalysisException unsupportedName = Assertions.assertThrows(AnalysisException.class,
+                () -> tvf.mergeFileSchema(schema("Ä", TPrimitiveType.INT), merged, 3));
+        Assertions.assertTrue(unsupportedName.getMessage().contains("Unsupported non-ASCII case conversion"));
+        Assertions.assertEquals(2, merged.size());
         Assertions.assertThrows(AnalysisException.class,
                 () -> tvf.mergeFileSchema(schema("id", TPrimitiveType.BIGINT), merged, 3));
         PFetchTableSchemaResult duplicate = schema("id", TPrimitiveType.INT).toBuilder()

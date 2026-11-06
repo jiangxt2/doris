@@ -52,6 +52,8 @@ suite("test_merge_schema_hdfs", "p0,external") {
                     "SELECT id, event, campaign FROM ${expected} ORDER BY id")
             quickTest("merge_schema_hdfs_${format}_file", "SELECT id, campaign FROM ${fileSource} ORDER BY id",
                     "SELECT id, campaign FROM ${expected} ORDER BY id")
+            quickTest("merge_schema_hdfs_${format}_missing_only", "SELECT campaign FROM ${source} ORDER BY campaign",
+                    "SELECT campaign FROM ${expected} ORDER BY campaign")
             for (String predicate : ["campaign IS NULL", "campaign = 'winter'"]) {
                 quickTest("merge_schema_hdfs_${format}_filter", "SELECT id FROM ${source} WHERE ${predicate} ORDER BY id",
                         "SELECT id FROM ${expected} WHERE ${predicate} ORDER BY id")

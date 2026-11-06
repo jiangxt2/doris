@@ -27,6 +27,10 @@ tables = {
     "new": pa.table({"id": pa.array([2], pa.int64()), "event": ["purchase"], "campaign": ["winter"]}),
     "conflict": pa.table({"id": ["not-a-number"], "event": ["click"]}),
     "complex": pa.table({"id": pa.array([3], pa.int64()), "event": ["view"], "tags": [["a"]]}),
+    "case_upper": pa.table({"ID": pa.array([3], pa.int64()), "EVENT": ["upper"], "Ä": ["first"]}),
+    "case_lower": pa.table({"id": pa.array([4], pa.int64()), "event": ["lower"], "ä": ["second"]}),
+    "ascii_upper": pa.table({"ID": pa.array([3], pa.int64()), "EVENT": ["upper"]}),
+    "ascii_lower": pa.table({"id": pa.array([4], pa.int64()), "event": ["lower"]}),
 }
 for name, table in tables.items():
     parquet.write_table(table, root / f"{name}.parquet")
