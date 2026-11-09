@@ -88,6 +88,32 @@ suite("test_merge_schema_s3", "p0,external") {
             }
             quickTest("merge_schema_${format}_counts", "SELECT COUNT(*), COUNT(campaign) FROM ${source}",
                     "SELECT COUNT(*), COUNT(campaign) FROM ${expected}")
+            explain {
+                sql "SELECT COUNT(*) FROM ${source}"
+                contains "pushdown agg=COUNT"
+            }
+            quickTest("merge_schema_${format}_count_star", "SELECT COUNT(*) FROM ${source}",
+                    "SELECT COUNT(*) FROM ${expected}")
+            if (format == "parquet") {
+                for (String pair : ["partition/dt=2026/old", "partition/dt=2026/new", "empty/old",
+                        "empty/empty", "dotless/dotless"]) {
+                    String key = "${prefix}/${format}/${pair}.parquet"
+                    keys.add(key)
+                    String fixture = pair.substring(pair.lastIndexOf('/') + 1)
+                    client.putObject(bucket, key,
+                            new File(context.dataPath, "test_data/schema_merge/${fixture}.parquet"))
+                }
+                String partitionUri = "s3://${bucket}/${prefix}/${format}/partition/dt=2026/*.parquet"
+                String partitionSource = "S3('uri'='${partitionUri}', ${properties}, 'path_partition_keys'='dt')"
+                quickTest("merge_schema_partition", "SELECT * FROM ${partitionSource} ORDER BY id",
+                        "SELECT campaign, event, id, CAST('2026' AS STRING) AS dt FROM ${expected} ORDER BY id")
+                String emptyUri = "s3://${bucket}/${prefix}/${format}/empty/*.parquet"
+                quickTest("merge_schema_empty_rows", "SELECT id, only_empty FROM S3('uri'='${emptyUri}', ${properties})",
+                        "SELECT CAST(1 AS BIGINT) AS id, CAST(NULL AS STRING) AS only_empty")
+                String dotlessUri = "s3://${bucket}/${prefix}/${format}/dotless/dotless.parquet"
+                quickTest("merge_schema_dotless_name", "SELECT i FROM S3('uri'='${dotlessUri}', ${properties})",
+                        "SELECT CAST(17 AS BIGINT) AS i")
+            }
             test {
                 sql """SELECT * FROM S3('uri'='s3://${bucket}/${prefix}/${format}/conflict/*.${format}',
                     ${properties})"""

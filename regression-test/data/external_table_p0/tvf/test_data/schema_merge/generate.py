@@ -35,3 +35,6 @@ tables = {
 for name, table in tables.items():
     parquet.write_table(table, root / f"{name}.parquet")
     orc.write_table(table, root / f"{name}.orc")
+
+parquet.write_table(pa.table({"only_empty": pa.array([], pa.string())}), root / "empty.parquet")
+parquet.write_table(pa.table({"ı": pa.array([17], pa.int64())}), root / "dotless.parquet")

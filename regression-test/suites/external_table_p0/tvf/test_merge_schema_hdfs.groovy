@@ -60,6 +60,12 @@ suite("test_merge_schema_hdfs", "p0,external") {
             }
             quickTest("merge_schema_hdfs_${format}_counts", "SELECT COUNT(*), COUNT(campaign) FROM ${source}",
                     "SELECT COUNT(*), COUNT(campaign) FROM ${expected}")
+            explain {
+                sql "SELECT COUNT(*) FROM ${source}"
+                contains "pushdown agg=COUNT"
+            }
+            quickTest("merge_schema_hdfs_${format}_count_star", "SELECT COUNT(*) FROM ${source}",
+                    "SELECT COUNT(*) FROM ${expected}")
             test {
                 sql """SELECT * FROM HDFS('uri'='${root}${prefix}/${format}/conflict/*.${format}', ${properties})"""
                 exception "Conflicting types"

@@ -99,6 +99,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -108,6 +109,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.stream.Collectors;
@@ -403,7 +405,7 @@ public abstract class ExternalFileTableValuedFunction extends TableValuedFunctio
     }
 
     private List<Column> getMergedTableColumns(TNetworkAddress address) throws AnalysisException {
-        Map<String, Column> merged = new TreeMap<>();
+        Map<String, Column> merged = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         int fileIndex = 0;
         try {
             for (TBrokerFileStatus file : fileStatuses) {
@@ -440,9 +442,11 @@ public abstract class ExternalFileTableValuedFunction extends TableValuedFunctio
             return columns;
         }
         List<Column> result = new ArrayList<>(merged.values());
-        Set<String> names = new HashSet<>(merged.keySet());
+        result.sort(Comparator.comparing(Column::getName));
+        Set<String> names = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        names.addAll(merged.keySet());
         for (String name : pathPartitionKeys) {
-            if (!names.add(name.toLowerCase(Locale.ROOT))) {
+            if (!names.add(name)) {
                 throw new AnalysisException("Path partition column conflicts with an existing column: " + name);
             }
             result.add(new Column(name, ScalarType.createVarcharType(ScalarType.MAX_VARCHAR_LENGTH), false));
@@ -453,7 +457,7 @@ public abstract class ExternalFileTableValuedFunction extends TableValuedFunctio
 
     void mergeFileSchema(InternalService.PFetchTableSchemaResult schema, Map<String, Column> merged, int fileIndex)
             throws AnalysisException {
-        Set<String> names = new HashSet<>();
+        Set<String> names = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
         for (int i = 0; i < schema.getColumnNums(); i++) {
             String originalName = schema.getColumnNames(i);
             String name = originalName.toLowerCase(Locale.ROOT);
@@ -462,7 +466,7 @@ public abstract class ExternalFileTableValuedFunction extends TableValuedFunctio
                         + ": " + originalName);
             }
             if (!names.add(name)) {
-                throw new AnalysisException("Repeated lowercase column names in matched file " + fileIndex + ": "
+                throw new AnalysisException("Repeated case-insensitive column names in matched file " + fileIndex + ": "
                         + name);
             }
             Type type = getColumnType(schema.getColumnTypes(i).getTypesList(), 0).key();
@@ -471,6 +475,10 @@ public abstract class ExternalFileTableValuedFunction extends TableValuedFunctio
                         + " has type " + type.toSql());
             }
             Column previous = merged.get(name);
+            if (previous != null && !previous.getName().equals(name)) {
+                throw new AnalysisException("Conflicting case-insensitive column names in matched file "
+                        + fileIndex + ": " + previous.getName() + " and " + name);
+            }
             if (previous != null && !previous.getType().equals(type)) {
                 throw new AnalysisException("Conflicting types for column " + name + " in matched file " + fileIndex
                         + ": " + previous.getType().toSql() + " and " + type.toSql());

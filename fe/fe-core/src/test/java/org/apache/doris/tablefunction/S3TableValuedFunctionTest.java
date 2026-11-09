@@ -218,7 +218,7 @@ public class S3TableValuedFunctionTest {
     @Test
     public void testMergeSchemaRejectsConflictsAndInvalidProperties() throws Exception {
         S3TableValuedFunction tvf = tvf();
-        Map<String, Column> merged = new TreeMap<>();
+        Map<String, Column> merged = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         tvf.mergeFileSchema(schema("ID", TPrimitiveType.INT), merged, 1);
         tvf.mergeFileSchema(schema("id", TPrimitiveType.INT), merged, 2);
         Assertions.assertEquals(1, merged.size());
@@ -234,13 +234,27 @@ public class S3TableValuedFunctionTest {
         PFetchTableSchemaResult duplicate = schema("id", TPrimitiveType.INT).toBuilder()
                 .setColumnNums(2).addColumnNames("ID")
                 .addColumnTypes(schema("id", TPrimitiveType.INT).getColumnTypes(0)).build();
-        Assertions.assertThrows(AnalysisException.class, () -> tvf.mergeFileSchema(duplicate, new TreeMap<>(), 1));
+        Assertions.assertThrows(AnalysisException.class,
+                () -> tvf.mergeFileSchema(duplicate, new TreeMap<>(String.CASE_INSENSITIVE_ORDER), 1));
+        PFetchTableSchemaResult unicodeDuplicate = schema("i", TPrimitiveType.INT).toBuilder()
+                .setColumnNums(2).addColumnNames("ı")
+                .addColumnTypes(schema("i", TPrimitiveType.INT).getColumnTypes(0)).build();
+        AnalysisException unicodeDuplicateError = Assertions.assertThrows(AnalysisException.class,
+                () -> tvf.mergeFileSchema(unicodeDuplicate, new TreeMap<>(String.CASE_INSENSITIVE_ORDER), 1));
+        Assertions.assertTrue(unicodeDuplicateError.getMessage().contains("Repeated case-insensitive column names"));
+        Map<String, Column> unicodeMerged = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        tvf.mergeFileSchema(schema("ı", TPrimitiveType.INT), unicodeMerged, 1);
+        Assertions.assertEquals("ı", unicodeMerged.values().iterator().next().getName());
+        AnalysisException unicodeConflictError = Assertions.assertThrows(AnalysisException.class,
+                () -> tvf.mergeFileSchema(schema("i", TPrimitiveType.INT), unicodeMerged, 2));
+        Assertions.assertTrue(unicodeConflictError.getMessage().contains("Conflicting case-insensitive column names"));
         PFetchTableSchemaResult complex = PFetchTableSchemaResult.newBuilder().setColumnNums(1)
                 .addColumnNames("nested").addColumnTypes(PTypeDesc.newBuilder()
                         .addTypes(PTypeNode.newBuilder().setType(TTypeNodeType.STRUCT.getValue())
                                 .setScalarType(PScalarType.newBuilder().setType(TPrimitiveType.STRUCT.getValue()))))
                 .build();
-        Assertions.assertThrows(AnalysisException.class, () -> tvf.mergeFileSchema(complex, new TreeMap<>(), 1));
+        Assertions.assertThrows(AnalysisException.class,
+                () -> tvf.mergeFileSchema(complex, new TreeMap<>(String.CASE_INSENSITIVE_ORDER), 1));
         Map<String, String> props = new HashMap<>(PROPERTIES);
         props.put("merge_schema", "invalid");
         Assertions.assertThrows(AnalysisException.class, () -> new S3TableValuedFunction(props));
@@ -272,12 +286,27 @@ public class S3TableValuedFunctionTest {
             service.when(BackendServiceProxy::getInstance).thenReturn(proxy);
             Assertions.assertThrows(AnalysisException.class, conflicting::getTableColumns);
         }
+
+        for (String partitionName : Arrays.asList("ı", "İ")) {
+            props.put("path_partition_keys", partitionName);
+            S3TableValuedFunction unicodeConflict = Mockito.spy(new S3TableValuedFunction(props,
+                    Collections.singletonList(file("one", 10))));
+            Mockito.doReturn(backend).when(unicodeConflict).getBackend();
+            Mockito.when(proxy.fetchTableStructureAsync(Mockito.any(), Mockito.any()))
+                    .thenReturn(CompletableFuture.completedFuture(schema("i", TPrimitiveType.STRING)));
+            try (MockedStatic<BackendServiceProxy> service = Mockito.mockStatic(BackendServiceProxy.class)) {
+                service.when(BackendServiceProxy::getInstance).thenReturn(proxy);
+                AnalysisException error = Assertions.assertThrows(AnalysisException.class,
+                        unicodeConflict::getTableColumns);
+                Assertions.assertTrue(error.getMessage().contains("Path partition column conflicts"));
+            }
+        }
     }
 
     @Test
     public void testMergeSchemaParameterizedTypes() throws Exception {
         S3TableValuedFunction tvf = tvf();
-        Map<String, Column> merged = new TreeMap<>();
+        Map<String, Column> merged = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         tvf.mergeFileSchema(parameterizedSchema("amount", TPrimitiveType.DECIMAL64, 0, 12, 2), merged, 1);
         tvf.mergeFileSchema(parameterizedSchema("amount", TPrimitiveType.DECIMAL64, 0, 12, 2), merged, 2);
         Assertions.assertThrows(AnalysisException.class,
